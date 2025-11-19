@@ -1,55 +1,58 @@
-"""
-Database Helper Functions
-
-MongoDB helper functions ready to use in your backend code.
-Import and use these functions in your API endpoints for database operations.
-"""
-
-from pymongo import MongoClient
-from datetime import datetime, timezone
 import os
-from dotenv import load_dotenv
-from typing import Union
-from pydantic import BaseModel
+import logging
+from typing import Any, Dict, List, Optional
+from datetime import datetime
 
-# Load environment variables from .env file
-load_dotenv()
+logger = logging.getLogger(__name__)
 
-_client = None
-db = None
+# Optional motor import with graceful fallback so the API can start even if Mongo driver isn't present
+try:
+    from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase  # type: ignore
+    MOTOR_AVAILABLE = True
+except Exception as e:  # ModuleNotFoundError or other import-time issues
+    AsyncIOMotorClient = None  # type: ignore
+    AsyncIOMotorDatabase = None  # type: ignore
+    MOTOR_AVAILABLE = False
+    logger.warning("motor not available; database features will be no-ops: %s", e)
 
-database_url = os.getenv("DATABASE_URL")
-database_name = os.getenv("DATABASE_NAME")
+DATABASE_URL = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "appdb")
 
-if database_url and database_name:
-    _client = MongoClient(database_url)
-    db = _client[database_name]
+_client: Optional["AsyncIOMotorClient"] = None
+_db: Optional["AsyncIOMotorDatabase"] = None
 
-# Helper functions for common database operations
-def create_document(collection_name: str, data: Union[BaseModel, dict]):
-    """Insert a single document with timestamp"""
-    if db is None:
-        raise Exception("Database not available. Check DATABASE_URL and DATABASE_NAME environment variables.")
+async def get_db():
+    """Get MongoDB database handle or raise if motor unavailable."""
+    if not MOTOR_AVAILABLE:
+        raise RuntimeError("MongoDB driver (motor) not available")
+    global _client, _db
+    if _db is None:
+        _client = AsyncIOMotorClient(DATABASE_URL)
+        _db = _client[DATABASE_NAME]
+    return _db
 
-    # Convert Pydantic model to dict if needed
-    if isinstance(data, BaseModel):
-        data_dict = data.model_dump()
-    else:
-        data_dict = data.copy()
+async def create_document(collection_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    if not MOTOR_AVAILABLE:
+        # Graceful no-op to avoid crashing the whole API
+        now = datetime.utcnow().isoformat()
+        return {**data, "id": "local", "created_at": now, "updated_at": now, "_warning": "motor-missing"}
+    db = await get_db()
+    now = datetime.utcnow()
+    data_with_meta = {**data, "created_at": now, "updated_at": now}
+    result = await db[collection_name].insert_one(data_with_meta)
+    inserted = await db[collection_name].find_one({"_id": result.inserted_id})
+    if inserted and "_id" in inserted:
+        inserted["id"] = str(inserted.pop("_id"))
+    return inserted or {}
 
-    data_dict['created_at'] = datetime.now(timezone.utc)
-    data_dict['updated_at'] = datetime.now(timezone.utc)
-
-    result = db[collection_name].insert_one(data_dict)
-    return str(result.inserted_id)
-
-def get_documents(collection_name: str, filter_dict: dict = None, limit: int = None):
-    """Get documents from collection"""
-    if db is None:
-        raise Exception("Database not available. Check DATABASE_URL and DATABASE_NAME environment variables.")
-    
-    cursor = db[collection_name].find(filter_dict or {})
-    if limit:
-        cursor = cursor.limit(limit)
-    
-    return list(cursor)
+async def get_documents(collection_name: str, filter_dict: Optional[Dict[str, Any]] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    if not MOTOR_AVAILABLE:
+        return []
+    db = await get_db()
+    cursor = db[collection_name].find(filter_dict or {}).limit(limit)
+    items: List[Dict[str, Any]] = []
+    async for doc in cursor:
+        if "_id" in doc:
+            doc["id"] = str(doc.pop("_id"))
+        items.append(doc)
+    return items

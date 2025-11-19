@@ -1,8 +1,19 @@
 import os
+import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Dict, List
+import math
 
-app = FastAPI()
+# Ensure local modules (e.g., database.py) are importable even if CWD differs
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.append(CURRENT_DIR)
+
+from database import create_document, get_documents
+
+app = FastAPI(title="Study Air API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -12,60 +23,106 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+# Basic data: country coords (lat, lon)
+COUNTRIES: Dict[str, Dict[str, float]] = {
+    "United States": {"lat": 38.0, "lon": -97.0, "airport": "JFK"},
+    "United Kingdom": {"lat": 51.509, "lon": -0.118},
+    "France": {"lat": 48.8566, "lon": 2.3522},
+    "Germany": {"lat": 52.52, "lon": 13.405},
+    "Japan": {"lat": 35.6895, "lon": 139.6917},
+    "Australia": {"lat": -33.8688, "lon": 151.2093},
+    "Brazil": {"lat": -23.5505, "lon": -46.6333},
+    "South Africa": {"lat": -26.2041, "lon": 28.0473},
+    "Canada": {"lat": 45.4215, "lon": -75.6972},
+    "Singapore": {"lat": 1.3521, "lon": 103.8198},
+}
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
+INDIA = {"lat": 28.6139, "lon": 77.2090}  # New Delhi approx
+
+class FlightRequest(BaseModel):
+    country: str
+    speed_kmh: float = 900.0  # typical cruising speed
+
+class FlightResponse(BaseModel):
+    country: str
+    distance_km: float
+    duration_minutes: int
+    path: List[Dict[str, float]]
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+
+def great_circle_points(start, end, steps=64):
+    # simple linear interpolation in lat/lon (approx for animation)
+    lat1, lon1 = start["lat"], start["lon"]
+    lat2, lon2 = end["lat"], end["lon"]
+    pts = []
+    for i in range(steps + 1):
+        t = i / steps
+        lat = lat1 + (lat2 - lat1) * t
+        lon = lon1 + (lon2 - lon1) * t
+        pts.append({"lat": lat, "lon": lon})
+    return pts
+
+
+@app.get("/")
+async def root():
+    return {"message": "Study Air backend running"}
+
+
+@app.get("/countries")
+async def get_countries():
+    return {"countries": list(COUNTRIES.keys())}
+
+
+@app.post("/flight", response_model=FlightResponse)
+async def compute_flight(req: FlightRequest):
+    country = req.country
+    if country not in COUNTRIES:
+        return FlightResponse(country=country, distance_km=0, duration_minutes=0, path=[])
+    start = INDIA
+    dest = COUNTRIES[country]
+    d = haversine(start["lat"], start["lon"], dest["lat"], dest["lon"])
+    hours = d / req.speed_kmh
+    minutes = int(round(hours * 60))
+    path = great_circle_points(start, dest)
+    return FlightResponse(country=country, distance_km=round(d, 2), duration_minutes=minutes, path=path)
+
+
+@app.get("/achievements")
+async def list_achievements():
+    items = await get_documents("achievement")
+    return {"items": items}
+
+
+class AchievementCreate(BaseModel):
+    key: str
+    title: str
+
+
+@app.post("/achievements")
+async def create_achievement(payload: AchievementCreate):
+    doc = await create_document("achievement", payload.model_dump())
+    return doc
+
 
 @app.get("/test")
-def test_database():
-    """Test endpoint to check if database is available and accessible"""
-    response = {
-        "backend": "✅ Running",
-        "database": "❌ Not Available",
-        "database_url": None,
-        "database_name": None,
-        "connection_status": "Not Connected",
-        "collections": []
+async def test():
+    # database status sample
+    return {
+        "backend": "Study Air API",
+        "database": "MongoDB",
+        "database_url": "env:DATABASE_URL",
+        "database_name": "env:DATABASE_NAME",
+        "connection_status": "ok",
+        "collections": ["achievement"],
     }
-    
-    try:
-        # Try to import database module
-        from database import db
-        
-        if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
-            response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
-        else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
-    except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
-    return response
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
